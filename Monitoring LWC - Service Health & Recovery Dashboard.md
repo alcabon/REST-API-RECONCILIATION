@@ -875,3 +875,243 @@ public static void retrySync(Id recordId) {
 **No stale data, no cached failures** - every retry is a fresh attempt with current state! 🎯
 
 This monitoring LWC is production-ready and gives you **complete visibility and control** over your sync health.
+
+---
+
+# SOQL Syntax Error - Fixed
+
+You're absolutely right! **SOQL does not support CASE expressions** inside aggregate functions.
+
+## ❌ Invalid SOQL
+
+```apex
+// This doesn't work in SOQL
+SELECT 
+    COUNT(Id) total,
+    COUNT_DISTINCT(CASE WHEN SyncStatus__c = 'SYNCED' THEN Id END) successes  // ❌ INVALID
+FROM Account
+WHERE LastSyncAttempt__c = LAST_N_DAYS:1
+```
+
+---
+
+## ✅ Corrected Solutions
+
+### Option 1: Use AggregateResult Without CASE (Recommended)
+
+```apex
+@AuraEnabled(cacheable=true)
+public static Map<String, Object> getSyncMetrics() {
+    Map<String, Object> metrics = new Map<String, Object>();
+    
+    // Query 1: Total syncs
+    AggregateResult[] totalStats = [
+        SELECT COUNT(Id) total
+        FROM Account
+        WHERE LastSyncAttempt__c = LAST_N_DAYS:1
+    ];
+    
+    Integer total = (Integer)totalStats[0].get('total');
+    
+    // Query 2: Successful syncs only
+    AggregateResult[] successStats = [
+        SELECT COUNT(Id) successes
+        FROM Account
+        WHERE LastSyncAttempt__c = LAST_N_DAYS:1
+        AND SyncStatus__c = 'SYNCED'
+    ];
+    
+    Integer successes = (Integer)successStats[0].get('successes');
+    
+    // Calculate success rate
+    Decimal successRate = total > 0 ? (successes * 100.0 / total) : 100;
+    
+    metrics.put('successRate', successRate);
+    metrics.put('totalSyncs', total);
+    metrics.put('successfulSyncs', successes);
+    
+    return metrics;
+}
+```
+
+### Option 2: Single Query with GROUP BY (Alternative)
+
+```apex
+@AuraEnabled(cacheable=true)
+public static Map<String, Object> getSyncMetrics() {
+    Map<String, Object> metrics = new Map<String, Object>();
+    
+    // Group by status to get counts
+    AggregateResult[] stats = [
+        SELECT SyncStatus__c status, COUNT(Id) count
+        FROM Account
+        WHERE LastSyncAttempt__c = LAST_N_DAYS:1
+        GROUP BY SyncStatus__c
+    ];
+    
+    Integer total = 0;
+    Integer successes = 0;
+    
+    for (AggregateResult ar : stats) {
+        Integer count = (Integer)ar.get('count');
+        total += count;
+        
+        if (ar.get('status') == 'SYNCED') {
+            successes = count;
+        }
+    }
+    
+    Decimal successRate = total > 0 ? (successes * 100.0 / total) : 100;
+    
+    metrics.put('successRate', successRate);
+    metrics.put('totalSyncs', total);
+    metrics.put('successfulSyncs', successes);
+    
+    return metrics;
+}
+```
+
+### Option 3: Get All Status Counts in One Query (Most Efficient)
+
+```apex
+@AuraEnabled(cacheable=true)
+public static Map<String, Object> getSyncMetrics() {
+    Map<String, Object> metrics = new Map<String, Object>();
+    
+    // Single query with grouping
+    AggregateResult[] stats = [
+        SELECT SyncStatus__c status, COUNT(Id) count
+        FROM Account
+        WHERE LastSyncAttempt__c = LAST_N_DAYS:1
+        AND SyncStatus__c != null
+        GROUP BY SyncStatus__c
+    ];
+    
+    Map<String, Integer> statusCounts = new Map<String, Integer>{
+        'SYNCED' => 0,
+        'ERROR' => 0,
+        'PENDING' => 0,
+        'PROCESSING' => 0,
+        'VALIDATION_FAILED' => 0
+    };
+    
+    Integer total = 0;
+    
+    for (AggregateResult ar : stats) {
+        String status = (String)ar.get('status');
+        Integer count = (Integer)ar.get('count');
+        statusCounts.put(status, count);
+        total += count;
+    }
+    
+    Integer successes = statusCounts.get('SYNCED');
+    Decimal successRate = total > 0 ? (successes * 100.0 / total) : 100;
+    
+    metrics.put('successRate', successRate);
+    metrics.put('totalSyncs', total);
+    metrics.put('statusBreakdown', statusCounts);
+    
+    return metrics;
+}
+```
+
+---
+
+## Complete Fixed Controller
+
+```apex
+public with sharing class SyncMonitorController {
+    
+    @AuraEnabled(cacheable=true)
+    public static Map<String, Object> getSyncMetrics() {
+        Map<String, Object> metrics = new Map<String, Object>();
+        
+        // === FIX: Use separate queries instead of CASE ===
+        
+        // Get all status counts in one query
+        AggregateResult[] stats = [
+            SELECT SyncStatus__c status, COUNT(Id) count
+            FROM Account
+            WHERE LastSyncAttempt__c = LAST_N_DAYS:1
+            AND SyncStatus__c != null
+            GROUP BY SyncStatus__c
+        ];
+        
+        // Initialize status map
+        Map<String, Integer> statusCounts = new Map<String, Integer>{
+            'SYNCED' => 0,
+            'ERROR' => 0,
+            'PENDING' => 0,
+            'PROCESSING' => 0,
+            'VALIDATION_FAILED' => 0,
+            'VERSION_CONFLICT' => 0
+        };
+        
+        Integer total = 0;
+        
+        // Populate from query results
+        for (AggregateResult ar : stats) {
+            String status = (String)ar.get('status');
+            Integer count = (Integer)ar.get('count');
+            statusCounts.put(status, count);
+            total += count;
+        }
+        
+        // Calculate success rate
+        Integer successes = statusCounts.get('SYNCED');
+        Decimal successRate = total > 0 ? (successes * 100.0 / total) : 100;
+        
+        metrics.put('successRate', successRate);
+        metrics.put('totalSyncs', total);
+        metrics.put('statusBreakdown', statusCounts);
+        
+        // Average sync duration (separate query)
+        AggregateResult[] avgDuration = [
+            SELECT AVG(SyncDuration__c) avg
+            FROM Account
+            WHERE SyncStatus__c = 'SYNCED'
+            AND LastSyncSuccess__c = LAST_N_HOURS:1
+            AND SyncDuration__c != null
+        ];
+        
+        metrics.put('avgDurationMs', avgDuration[0].get('avg'));
+        
+        return metrics;
+    }
+    
+    // ... rest of the controller remains the same
+}
+```
+
+---
+
+## Why SOQL Doesn't Support CASE in Aggregates
+
+**SOQL limitations compared to SQL**:
+
+| Feature | SQL | SOQL |
+|---------|-----|------|
+| `CASE` expressions | ✅ Yes | ❌ No |
+| `CASE` in aggregates | ✅ `SUM(CASE...)` | ❌ Not supported |
+| Conditional aggregation | ✅ Multiple ways | ⚠️ Use `GROUP BY` + filters |
+| Subqueries in SELECT | ✅ Yes | ⚠️ Limited (only relationship queries) |
+
+**Workarounds in SOQL**:
+1. Multiple queries
+2. `GROUP BY` with filtering in Apex
+3. Formula fields (if logic is simple)
+4. Aggregate in Apex code
+
+---
+
+## Performance Note
+
+**Option 3 (GROUP BY) is most efficient**:
+```
+✅ 1 SOQL query (not 2)
+✅ Returns all status counts
+✅ Single governor limit hit
+✅ Can cache result
+```
+
+The corrected code uses this approach! 🎯
