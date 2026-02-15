@@ -520,4 +520,3 @@ These diagrams cover:
 9. **Conflict resolution** - Version management
 10. **Timeline** - End-to-end timing
 
-You can copy these into any Mermaid-compatible tool (Markdown editors, Mermaid Live Editor, Notion, GitHub, etc.) to visualize the complete async sync architecture! 🎨
